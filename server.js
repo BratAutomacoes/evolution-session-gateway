@@ -2,6 +2,9 @@ import express from "express";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
+import pg from "pg";
+
+const { Pool } = pg;
 
 const app = express();
 
@@ -10,13 +13,19 @@ app.use(express.json({
   inflate: true
 }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 80;
 
 const IMPORT_TOKEN = process.env.IMPORT_TOKEN;
 const EVOLUTION_URL = process.env.EVOLUTION_URL;
 const EVOLUTION_APIKEY = process.env.EVOLUTION_APIKEY;
 const INSTANCE_NAME = process.env.INSTANCE_NAME;
+const EVOLUTION_INSTANCE_ID = process.env.EVOLUTION_INSTANCE_ID;
+const POSTGRES_URI = process.env.POSTGRES_URI;
 const SESSION_DIR = process.env.SESSION_DIR || "/app/data/sessions";
+
+const pool = POSTGRES_URI
+  ? new Pool({ connectionString: POSTGRES_URI })
+  : null;
 
 function auth(req, res, next) {
   const token = req.header("token");
@@ -63,11 +72,94 @@ async function getEvolutionState() {
   return data?.instance?.state || "close";
 }
 
+async function getInstanceFromDb() {
+  if (!pool) {
+    throw new Error("POSTGRES_URI não configurada");
+  }
+
+  const result = await pool.query(
+    `
+    SELECT 
+      id,
+      name,
+      "connectionStatus",
+      "ownerJid",
+      number,
+      "clientName",
+      "createdAt",
+      "updatedAt"
+    FROM "Instance"
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [EVOLUTION_INSTANCE_ID]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function getSessionFromDb() {
+  if (!pool) {
+    throw new Error("POSTGRES_URI não configurada");
+  }
+
+  const result = await pool.query(
+    `
+    SELECT 
+      "sessionId",
+      LENGTH(creds) AS tamanho_creds,
+      LEFT(creds, 120) AS inicio_creds,
+      "createdAt"
+    FROM "Session"
+    WHERE "sessionId" = $1
+    LIMIT 1
+    `,
+    [EVOLUTION_INSTANCE_ID]
+  );
+
+  return result.rows[0] || null;
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "evolution-session-gateway",
+    routes: [
+      "/health",
+      "/instance/status",
+      "/debug/evolution-db"
+    ]
+  });
+});
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "evolution-session-gateway"
   });
+});
+
+app.get("/debug/evolution-db", auth, async (req, res) => {
+  try {
+    const instance = await getInstanceFromDb();
+    const session = await getSessionFromDb();
+
+    return res.json({
+      ok: true,
+      databaseConnected: true,
+      evolutionInstanceId: EVOLUTION_INSTANCE_ID,
+      instanceFound: Boolean(instance),
+      sessionFound: Boolean(session),
+      instance,
+      session
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      databaseConnected: false,
+      error: String(error.message || error)
+    });
+  }
 });
 
 app.get("/instance/status", auth, async (req, res) => {
@@ -183,6 +275,7 @@ app.post("/instance/import-web-session/finish", auth, async (req, res) => {
       {
         finishedAt: new Date().toISOString(),
         instanceName: INSTANCE_NAME,
+        evolutionInstanceId: EVOLUTION_INSTANCE_ID,
         evolutionUrl: EVOLUTION_URL
       },
       null,
