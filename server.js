@@ -3,6 +3,7 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import pg from "pg";
+import { initAuthCreds } from "@whiskeysockets/baileys";
 
 const { Pool } = pg;
 
@@ -13,7 +14,10 @@ app.use((req, res, next) => {
 
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, token, authorization, apikey");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, token, authorization, apikey"
+  );
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (req.method === "OPTIONS") {
@@ -23,10 +27,12 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({
-  limit: "200mb",
-  inflate: true
-}));
+app.use(
+  express.json({
+    limit: "200mb",
+    inflate: true
+  })
+);
 
 const PORT = process.env.PORT || 80;
 
@@ -66,7 +72,16 @@ function sha256Json(payload) {
     .digest("hex");
 }
 
-function asBufferObject(value) {
+function isBufferLike(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.length === "number" &&
+    typeof value.byteLength === "number"
+  );
+}
+
+function toBase64BufferObject(value) {
   if (!value) return value;
 
   if (value.type === "Buffer" && value.data) {
@@ -80,7 +95,53 @@ function asBufferObject(value) {
     };
   }
 
+  if (Buffer.isBuffer(value)) {
+    return {
+      type: "Buffer",
+      data: value.toString("base64")
+    };
+  }
+
+  if (value instanceof Uint8Array || isBufferLike(value)) {
+    return {
+      type: "Buffer",
+      data: Buffer.from(value).toString("base64")
+    };
+  }
+
   return value;
+}
+
+function normalizeBuffers(value) {
+  if (!value) return value;
+
+  if (value.type === "Buffer" && value.data) {
+    return value;
+  }
+
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return toBase64BufferObject(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeBuffers);
+  }
+
+  if (typeof value === "object") {
+    const output = {};
+
+    for (const [key, val] of Object.entries(value)) {
+      output[key] = normalizeBuffers(val);
+    }
+
+    return output;
+  }
+
+  return value;
+}
+
+function asBufferObject(value) {
+  return toBase64BufferObject(value);
 }
 
 function keyPair(pair) {
@@ -147,11 +208,12 @@ function isDoubleEncoded(raw) {
 }
 
 function encodeCredsForStorage(creds, previousRaw) {
-  const json = JSON.stringify(creds);
+  const normalized = normalizeBuffers(creds);
+  const json = JSON.stringify(normalized);
 
   const forceDoubleEncode =
     process.env.CREDS_DOUBLE_ENCODE === undefined
-      ? true
+      ? false
       : process.env.CREDS_DOUBLE_ENCODE === "true";
 
   if (previousRaw) {
@@ -257,10 +319,7 @@ async function backupCurrentSession() {
   const filename = `session-${EVOLUTION_INSTANCE_ID}-${Date.now()}.json`;
   const backupPath = path.join(BACKUP_DIR, filename);
 
-  await fs.writeFile(
-    backupPath,
-    JSON.stringify(current || null, null, 2)
-  );
+  await fs.writeFile(backupPath, JSON.stringify(current || null, null, 2));
 
   return {
     backupPath,
@@ -319,7 +378,10 @@ async function importSessionToEvolution(jobId) {
   const ownerJid = device.meJid || previousCreds.me?.id || null;
   const number = ownerJid ? ownerJid.split("@")[0].replace(/\D/g, "") : null;
 
+  const baseCreds = normalizeBuffers(initAuthCreds());
+
   const importedCreds = {
+    ...baseCreds,
     ...previousCreds,
 
     noiseKey: keyPair(device.noiseKey),
@@ -345,11 +407,60 @@ async function importSessionToEvolution(jobId) {
       name: INSTANCE_NAME
     },
 
-    registered: true
+    registered: true,
+
+    processedHistoryMessages:
+      previousCreds.processedHistoryMessages ||
+      baseCreds.processedHistoryMessages ||
+      [],
+
+    nextPreKeyId:
+      previousCreds.nextPreKeyId || baseCreds.nextPreKeyId || 1,
+
+    firstUnuploadedPreKeyId:
+      previousCreds.firstUnuploadedPreKeyId ||
+      baseCreds.firstUnuploadedPreKeyId ||
+      1,
+
+    accountSyncCounter:
+      previousCreds.accountSyncCounter || baseCreds.accountSyncCounter || 0,
+
+    accountSettings:
+      previousCreds.accountSettings ||
+      baseCreds.accountSettings ||
+      {
+        unarchiveChats: false
+      },
+
+    lastAccountSyncTimestamp:
+      previousCreds.lastAccountSyncTimestamp || Math.floor(Date.now() / 1000),
+
+    pairingEphemeralKeyPair:
+      previousCreds.pairingEphemeralKeyPair ||
+      baseCreds.pairingEphemeralKeyPair,
+
+    routingInfo:
+      previousCreds.routingInfo || baseCreds.routingInfo,
+
+    myAppStateKeyId:
+      previousCreds.myAppStateKeyId || baseCreds.myAppStateKeyId
   };
 
-  if (!importedCreds.signalIdentities) {
-    importedCreds.signalIdentities = [];
+  if (
+    !importedCreds.signalIdentities ||
+    importedCreds.signalIdentities.length === 0
+  ) {
+    importedCreds.signalIdentities = ownerJid
+      ? [
+          {
+            identifier: {
+              name: ownerJid,
+              deviceId: 0
+            },
+            identifierKey: importedCreds.signedIdentityKey.public
+          }
+        ]
+      : [];
   }
 
   const credsText = encodeCredsForStorage(importedCreds, previousRaw);
